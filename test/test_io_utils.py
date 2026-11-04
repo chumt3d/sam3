@@ -120,3 +120,72 @@ class TestLoadVideoFramesRouting(unittest.TestCase):
         )
         mock_load_video.assert_called_once()
         self.assertEqual(result, ("frames", 480, 640))
+
+
+class TestDiskBackedVideoFrames(unittest.TestCase):
+    def test_native_pixels_scalar_batch_indexing_and_close(self):
+        import cv2
+        import numpy as np
+        import torch
+        from sam3.model.io_utils import DiskBackedVideoFrames
+
+        source = [np.arange(3 * 4 * 3, dtype=np.uint8).reshape(3, 4, 3),
+                  np.full((3, 4, 3), 251, dtype=np.uint8)]
+        class Capture:
+            def __init__(self):
+                self.frames = iter(source)
+                self.released = False
+            def read(self):
+                frame = next(self.frames, None)
+                return frame is not None, frame
+            def release(self):
+                self.released = True
+        cap = Capture()
+        carrier = DiskBackedVideoFrames(cap, 2, (0.5,)*3, (0.5,)*3)
+        carrier.device = torch.device("cpu")
+        try:
+            self.assertEqual(len(carrier), 2)
+            self.assertTrue(cap.released)
+            expected_rgb = cv2.resize(cv2.cvtColor(source[0], cv2.COLOR_BGR2RGB),
+                                      (2,2), interpolation=cv2.INTER_CUBIC)
+            expected = (torch.from_numpy(expected_rgb.astype(np.float32)).permute(2,0,1)-0.5)/0.5
+            torch.testing.assert_close(carrier[0], expected, rtol=0, atol=0)
+            torch.testing.assert_close(carrier[torch.tensor([0])], expected.unsqueeze(0), rtol=0, atol=0)
+            torch.testing.assert_close(carrier[0:1], expected.unsqueeze(0), rtol=0, atol=0)
+            with self.assertRaises(IndexError):
+                carrier[2]
+        finally:
+            carrier.close()
+        self.assertTrue(carrier._file.closed)
+        with self.assertRaises(ValueError):
+            carrier[0]
+
+    def test_decode_failure_closes_capture_and_spool(self):
+        from sam3.model.io_utils import DiskBackedVideoFrames
+        class Capture:
+            released = False
+            def read(self):
+                raise RuntimeError("decode failed")
+            def release(self):
+                self.released = True
+        cap = Capture()
+        with self.assertRaisesRegex(RuntimeError, "decode failed"):
+            DiskBackedVideoFrames(cap, 2, (0.5,)*3, (0.5,)*3)
+        self.assertTrue(cap.released)
+
+    def test_start_session_accepts_actual_multiplex_init_signature(self):
+        from sam3.model.sam3_base_predictor import Sam3BasePredictor
+        class MultiplexSignature:
+            def init_state(self, resource_path, offload_video_to_cpu=False,
+                           async_loading_frames=False, use_torchcodec=False,
+                           use_cv2=False, input_is_mp4=False):
+                return {"resource":resource_path, "offload":offload_video_to_cpu}
+        predictor = Sam3BasePredictor()
+        predictor.model = MultiplexSignature()
+        predictor.async_loading_frames = True
+        response = predictor.handle_request({"type":"start_session", "resource_path":"video.mp4",
+                                              "offload_video_to_cpu":True})
+        self.assertEqual(predictor._get_session(response["session_id"])["state"],
+                         {"resource":"video.mp4", "offload":True})
+        predictor.handle_request({"type":"close_session", "session_id":response["session_id"],
+                                  "run_gc_collect":False})
