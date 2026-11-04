@@ -446,6 +446,12 @@ class Sam3BasePredictor:
             # per-frame slots, so they don't need separate handling.
             state = session.get("state")
             if isinstance(state, dict):
+                batch = state.get("input_batch")
+                nested = getattr(batch, "img_batch", None)
+                frames = getattr(nested, "tensors", None)
+                close_frames = getattr(frames, "close", None)
+                if callable(close_frames):
+                    close_frames()
                 state.clear()
             session.clear()
             del session

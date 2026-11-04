@@ -287,6 +287,82 @@ def load_video_frames_from_video_file(
         raise RuntimeError("video_loader_type must be either 'cv2' or 'torchcodec'")
 
 
+class DiskBackedVideoFrames:
+    """Keep cv2's exact resized RGB bytes on disk; materialize only indexed frames.
+
+    The caller owns close(). The anonymous file has no persistent path. pread
+    keeps process buffers bounded even after traversing a long recording.
+    """
+
+    def __init__(self, cap, image_size, img_mean, img_std):
+        import tempfile
+        import cv2
+
+        self._file = tempfile.TemporaryFile()
+        self._image_size = image_size
+        self._record_bytes = image_size * image_size * 3
+        self._img_mean = img_mean
+        self._img_std = img_std
+        self.device = torch.device("cuda")
+        self.dtype = torch.float32
+        self._count = 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                resized = cv2.resize(rgb, (image_size, image_size), interpolation=cv2.INTER_CUBIC)
+                self._file.write(resized.tobytes())
+                self._count += 1
+            self._file.flush()
+            if not self._count:
+                raise RuntimeError("No frames could be decoded from video")
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            cap.release()
+
+    @property
+    def shape(self):
+        return (self._count, 3, self._image_size, self._image_size)
+
+    def __len__(self):
+        return self._count
+
+    def __getitem__(self, index):
+        scalar = isinstance(index, int)
+        if isinstance(index, torch.Tensor):
+            scalar = index.ndim == 0
+            index = index.item() if scalar else index.tolist()
+        indices = [index] if scalar else (list(range(self._count))[index] if isinstance(index, slice) else list(index))
+        frames = []
+        for idx in indices:
+            if not isinstance(idx, int) or not 0 <= idx < self._count:
+                raise IndexError("video frame index outside source")
+            raw = os.pread(self._file.fileno(), self._record_bytes, idx * self._record_bytes)
+            if len(raw) != self._record_bytes:
+                raise RuntimeError("incomplete decoded frame record")
+            rgb = np.frombuffer(raw, dtype=np.uint8).reshape(self._image_size, self._image_size, 3)
+            frames.append(rgb.astype(np.float32))
+        # Preserve the native cv2 loader's exact arithmetic, including its lack
+        # of /255. Model-quality parity with the other loaders is unqualified.
+        tensor = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).to(self.device)
+        mean = torch.tensor(self._img_mean, dtype=torch.float16, device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor(self._img_std, dtype=torch.float16, device=self.device).view(1, 3, 1, 1)
+        tensor -= mean
+        tensor /= std
+        return tensor[0] if scalar else tensor
+
+    def close(self):
+        self._file.close()
+
+    def __del__(self):
+        if hasattr(self, "_file"):
+            self.close()
+
+
 def load_video_frames_from_video_file_using_cv2(
     video_path: str,
     image_size: int,
@@ -313,10 +389,16 @@ def load_video_frames_from_video_file_using_cv2(
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
 
+    # SAM3.1 selector masks and native source PTS refer to the raw raster.
+    cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
     original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     num_frames = num_frames if num_frames > 0 else None
+
+    if offload_video_to_cpu:
+        frames = DiskBackedVideoFrames(cap, image_size, img_mean, img_std)
+        return frames, original_height, original_width
 
     frames = []
     pbar = tqdm(desc=f"frame loading (OpenCV) [rank={RANK}]", total=num_frames)
