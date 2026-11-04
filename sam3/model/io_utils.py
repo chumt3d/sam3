@@ -332,11 +332,15 @@ class DiskBackedVideoFrames:
         return self._count
 
     def __getitem__(self, index):
-        scalar = isinstance(index, int)
+        from numbers import Integral
+
+        scalar = isinstance(index, Integral)
+        if scalar:
+            index = int(index)
         if isinstance(index, torch.Tensor):
             scalar = index.ndim == 0
             index = index.item() if scalar else index.tolist()
-        indices = [index] if scalar else (list(range(self._count))[index] if isinstance(index, slice) else list(index))
+        indices = [index] if scalar else (range(self._count)[index] if isinstance(index, slice) else list(index))
         frames = []
         for idx in indices:
             if not isinstance(idx, int) or not 0 <= idx < self._count:
