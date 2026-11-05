@@ -304,7 +304,7 @@ class DiskBackedVideoFrames:
         self._img_mean = img_mean
         self._img_std = img_std
         self.device = torch.device("cuda")
-        self.dtype = torch.float32
+        self.dtype = torch.float16
         self._count = 0
         try:
             while True:
@@ -350,9 +350,10 @@ class DiskBackedVideoFrames:
                 raise RuntimeError("incomplete decoded frame record")
             rgb = np.frombuffer(raw, dtype=np.uint8).reshape(self._image_size, self._image_size, 3)
             frames.append(rgb.astype(np.float32))
-        # Preserve the native cv2 loader's exact arithmetic, including its lack
-        # of /255. Model-quality parity with the other loaders is unqualified.
-        tensor = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).to(self.device)
+        # Match upstream PR #522 (e9c61e87dbd885b5989ab2fe226bbc4c9d129599):
+        # cast to fp16, scale RGB to [0, 1], then apply mean/std normalization.
+        tensor = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).to(self.device, dtype=torch.float16)
+        tensor /= 255.0
         mean = torch.tensor(self._img_mean, dtype=torch.float16, device=self.device).view(1, 3, 1, 1)
         std = torch.tensor(self._img_std, dtype=torch.float16, device=self.device).view(1, 3, 1, 1)
         tensor -= mean
@@ -430,6 +431,9 @@ def load_video_frames_from_video_file_using_cv2(
     # Convert to tensor
     frames_np = np.stack(frames, axis=0).astype(np.float32)  # (T, H, W, C)
     video_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # (T, C, H, W)
+    # Upstream PR #522, e9c61e87dbd885b5989ab2fe226bbc4c9d129599.
+    video_tensor = video_tensor.to(dtype=torch.float16)
+    video_tensor /= 255.0
 
     # pyrefly: ignore [bad-assignment]
     img_mean = torch.tensor(img_mean, dtype=torch.float16).view(1, 3, 1, 1)
